@@ -1,0 +1,33 @@
+name: Scrape opportunities
+
+on:
+  schedule:
+    # Every 6 hours. UTC. Free for public repos.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NODE_ENV: production
+      LOG_LEVEL: info
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install deps
+        run: npm ci --no-audit --no-fund
+      - name: Run all enabled sources
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          SOURCES: ${{ vars.SOURCES || 'chevening,daad,erasmus,euraxess,findaphd,jobs-ac-uk' }}
+        run: npm run run:once
