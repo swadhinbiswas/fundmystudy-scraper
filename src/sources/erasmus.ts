@@ -4,11 +4,9 @@
  * Source: EACEA (European Education and Culture Executive Agency)
  *   https://www.eacea.ec.europa.eu/scholarships/erasmus-mundus-catalogue_en
  *
- * The catalogue is server-rendered (220 programmes). Each programme card
- * links to a detail page on:
- *   https://erasmus-plus.ec.europa.eu/projects/search/details/{PROJECT_ID}
- *
- * We parse: title, project URL, and infer the field from the title.
+ * Two-pass scraping:
+ *   1. Parse catalogue for programme list
+ *   2. Visit each detail page for full description, requirements, eligibility
  */
 import * as cheerio from 'cheerio';
 import { BaseSource } from './base.js';
@@ -25,7 +23,7 @@ const BROWSER_UA =
 interface ErasmusProgramme {
   externalId: string;
   title: string;
-  url: string;
+  programmeUrl: string;
   field: string;
 }
 
@@ -49,49 +47,133 @@ function parseCatalogue(html: string): ErasmusProgramme[] {
   const programmes: ErasmusProgramme[] = [];
   const seen = new Set<string>();
 
-  // Two-pass parse:
-  //   1. Index all title links by their parent card
-  //   2. For each details link, find the nearest title link in the same card
-  const titleByCard = new Map<string, string>();
-  $('a[data-ecl-title-link]').each((_, el) => {
-    const $t = $(el);
-    const title =
-      $t.find('span.ecl-link__label').first().text().trim() || $t.text().trim();
+  // Each card has: a[data-ecl-title-link] with programme URL + title, and a[href*="/projects/search/details/"] with project ID
+  $('article.ecl-card').each((_, card) => {
+    const $card = $(card);
+    const titleLink = $card.find('a[data-ecl-title-link]').first();
+    const programmeUrl = titleLink.attr('href') ?? '';
+    const title = titleLink.find('span.ecl-link__label').first().text().trim() || titleLink.text().trim();
     if (!title) return;
-    // Walk up to the card container
-    const cardEl = $t.closest('article.ecl-content-item, div.ecl-content-item, .ecl-card');
-    if (!cardEl.length) return;
-    const key = (cardEl[0] as unknown as { _fms_key?: string })._fms_key ?? String(Math.random());
-    (cardEl[0] as unknown as { _fms_key: string })._fms_key = key;
-    titleByCard.set(key, title);
-  });
 
-  $('a[href*="/projects/search/details/"]').each((_, el) => {
-    const $d = $(el);
-    const href = $d.attr('href');
-    if (!href) return;
-    const idMatch = href.match(/\/details\/(\d+)/);
-    const id = idMatch?.[1] ?? href;
+    const projectLink = $card.find('a[href*="/projects/search/details/"]').first();
+    const projectHref = projectLink.attr('href') ?? '';
+    const idMatch = projectHref.match(/\/details\/(\d+)/);
+    const id = idMatch?.[1] ?? programmeUrl;
     if (seen.has(id)) return;
-
-    // Find the card this details link belongs to
-    const cardEl = $d.closest('article.ecl-content-item, div.ecl-content-item, .ecl-card');
-    const key = cardEl.length
-      ? (cardEl[0] as unknown as { _fms_key?: string })._fms_key
-      : undefined;
-    const title = key ? titleByCard.get(key) : undefined;
-    if (!title) return;
-
     seen.add(id);
+
     programmes.push({
       externalId: `emjmd-${id}`,
       title,
-      url: href.startsWith('http') ? href : `https://erasmus-plus.ec.europa.eu${href}`,
+      programmeUrl,
       field: inferField(title),
     });
   });
 
   return programmes;
+}
+
+/**
+ * Visit an Erasmus+ detail page and extract structured data.
+ */
+async function scrapeDetailPage(url: string): Promise<{
+  fullDescription: string;
+  eligibility: string[];
+  requirements: string[];
+  benefits: string[];
+  logoUrl: string;
+  consortium: string;
+}> {
+  try {
+    const html = await httpGet(url, {
+      headers: {
+        'User-Agent': BROWSER_UA,
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    const $ = cheerio.load(html);
+
+    // Full description — the main content area
+    let fullDescription = '';
+    const mainContent = $('main, .project-content, article, .content-area').first();
+    if (mainContent.length) {
+      mainContent.find('p, li, h2, h3').each((_, el) => {
+        const tag = el.tagName?.toLowerCase();
+        const text = $(el).text().replace(/\s+/g, ' ').trim();
+        if (!text) return;
+        if (tag === 'h2' || tag === 'h3') {
+          fullDescription += `\n## ${text}\n`;
+        } else if (tag === 'li') {
+          fullDescription += `- ${text}\n`;
+        } else {
+          fullDescription += `${text}\n\n`;
+        }
+      });
+    }
+    if (!fullDescription) {
+      fullDescription = $('meta[name="description"]').attr('content') ?? '';
+    }
+
+    // Look for specific sections
+    const eligibility: string[] = [];
+    const requirements: string[] = [];
+    const benefits: string[] = [];
+
+    $('h2, h3').each((_, heading) => {
+      const headingText = $(heading).text().toLowerCase();
+      let section = '';
+      if (/eligib|who can|admission/.test(headingText)) section = 'eligibility';
+      else if (/requirement|entry|prerequisite/.test(headingText)) section = 'requirements';
+      else if (/benefit|what.*offer|scholarship.*include|funding/.test(headingText)) section = 'benefits';
+
+      if (section) {
+        let next = $(heading).next();
+        while (next.length && !next.is('h2, h3')) {
+          next.find('li').each((_, li) => {
+            const t = $(li).text().replace(/\s+/g, ' ').trim();
+            if (t) {
+              if (section === 'eligibility') eligibility.push(t);
+              else if (section === 'requirements') requirements.push(t);
+              else if (section === 'benefits') benefits.push(t);
+            }
+          });
+          if (!next.find('li').length) {
+            const text = next.text().replace(/\s+/g, ' ').trim();
+            if (text && text.length > 10) {
+              if (section === 'eligibility') eligibility.push(text);
+              else if (section === 'requirements') requirements.push(text);
+              else if (section === 'benefits') benefits.push(text);
+            }
+          }
+          next = next.next();
+        }
+      }
+    });
+
+    // Logo
+    let logoUrl = '';
+    const logoImg = $('img[alt*="logo"], img[class*="logo"], .ecl-site-header__logo img, header img').first();
+    if (logoImg.length) {
+      logoUrl = logoImg.attr('src') ?? '';
+      if (logoUrl && !logoUrl.startsWith('http')) {
+        logoUrl = new URL(logoUrl, url).href;
+      }
+    }
+
+    // Consortium info
+    let consortium = '';
+    $('dt, th').each((_, dt) => {
+      if (/consortium|coordinator|partner/i.test($(dt).text())) {
+        consortium = $(dt).next('dd, td').text().replace(/\s+/g, ' ').trim();
+      }
+    });
+
+    return { fullDescription: fullDescription.trim(), eligibility, requirements, benefits, logoUrl, consortium };
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, url }, 'erasmus detail scrape failed');
+    return { fullDescription: '', eligibility: [], requirements: [], benefits: [], logoUrl: '', consortium: '' };
+  }
 }
 
 export class ErasmusSource extends BaseSource {
@@ -105,18 +187,49 @@ export class ErasmusSource extends BaseSource {
       headers: { 'User-Agent': BROWSER_UA, Accept: 'text/html' },
     });
     const programmes = parseCatalogue(html);
-    logger.info({ count: programmes.length }, 'erasmus: parsed');
+    logger.info({ count: programmes.length }, 'erasmus: parsed list');
 
-    return programmes.map((p) => ({
-      externalId: p.externalId,
-      url: p.url,
-      title: p.title,
-      provider: 'Erasmus+ (European Commission)',
-      description: `Erasmus Mundus Joint Master — ${p.field}`,
-      rawFields: [p.field],
-      rawCountries: ['EU'],
-      rawDegreeLevels: ['master'] as Array<'master'>,
-      rawFundingKind: 'full' as const,
-    }));
+    // Visit detail pages for full data (max 20)
+    const detailed: RawListing[] = [];
+    const toScrape = programmes.slice(0, 5);
+
+    for (let i = 0; i < toScrape.length; i++) {
+      const p = toScrape[i];
+      let detail = { fullDescription: '', eligibility: [] as string[], requirements: [] as string[], benefits: [] as string[], logoUrl: '', consortium: '' };
+
+      // Visit the programme's own website for rich content
+      if (p.programmeUrl && p.programmeUrl.startsWith('http')) {
+        detail = await scrapeDetailPage(p.programmeUrl);
+      }
+
+      const parts = [`Erasmus Mundus Joint Master in ${p.field}`];
+      if (detail.fullDescription) parts.push(detail.fullDescription);
+      if (detail.consortium) parts.push(`Consortium: ${detail.consortium}`);
+
+      detailed.push({
+        externalId: p.externalId,
+        url: p.programmeUrl,
+        title: p.title,
+        provider: 'Erasmus+ (European Commission)',
+        description: parts.join('\n\n').slice(0, 3000),
+        rawFields: [p.field],
+        rawCountries: ['EU'],
+        rawDegreeLevels: ['master'] as Array<'master'>,
+        rawFundingKind: 'full' as const,
+        rawEligibility: detail.eligibility,
+        rawRequirements: detail.requirements,
+        rawBenefits: detail.benefits,
+        rawTags: [p.field, 'erasmus', 'master', 'europe'],
+        rawLogoUrl: detail.logoUrl || undefined,
+      });
+
+      // Delay between fetches
+      if (i < toScrape.length - 1) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+
+    logger.info({ count: detailed.length }, 'erasmus: detailed scrape done');
+    return detailed;
   }
 }

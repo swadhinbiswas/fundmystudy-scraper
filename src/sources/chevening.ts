@@ -33,12 +33,13 @@ export class CheveningSource extends BaseSource {
         title: 'Chevening Scholarship',
         provider: 'UK Foreign, Commonwealth & Development Office',
         description:
-          'Fully funded master’s degree in any subject at any UK university. Covers tuition, living, and travel. Open to applicants from Chevening-eligible countries.',
+          'Fully funded master\'s degree in any subject at any UK university. Covers tuition, living, and travel. Open to applicants from Chevening-eligible countries.',
         rawFields: ['all'],
         rawCountries: ['GB'],
         rawDegreeLevels: ['master'],
         rawFundingKind: 'full',
         rawIeltsRequired: true,
+        rawFundingCovers: ['tuition', 'living', 'travel', 'insurance'],
       },
     ];
   }

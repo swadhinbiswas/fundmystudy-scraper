@@ -44,6 +44,17 @@ export interface RawListing {
   rawIeltsRequired?: boolean;
   /** 4.0 scale. */
   rawGpaMin?: number;
+
+  /** Rich detail fields */
+  rawRequirements?: string[];
+  rawDocuments?: string[];
+  rawEligibility?: string[];
+  rawBenefits?: string[];
+  rawTags?: string[];
+  rawApplicationFee?: boolean;
+  rawRemote?: boolean;
+  rawFundingCovers?: string[];
+  rawLogoUrl?: string;
 }
 
 export interface Opportunity {
@@ -64,11 +75,21 @@ export interface Opportunity {
     kind: FundingKind;
     amount?: number;
     currency?: string;
+    covers?: string[];
   };
 
   deadline?: string;
   ieltsRequired?: boolean;
-  gpaMin?: number;
+  gpaMin?: boolean;
+
+  requirements?: string[];
+  documents?: string[];
+  eligibility?: string[];
+  benefits?: string[];
+  tags?: string[];
+  applicationFee?: boolean;
+  remote?: boolean;
+  logoUrl?: string;
 
   status: OpportunityStatus;
   lastSeenAt: number;

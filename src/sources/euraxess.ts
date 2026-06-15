@@ -2,18 +2,15 @@
  * EURAXESS — the European Commission's researcher job portal.
  * Source: https://euraxess.ec.europa.eu/jobs/search
  *
- * Each job is rendered as <article class="ecl-content-item"> with:
- *   h3.ecl-content-block__title  →  title + job URL
- *   ul.ecl-content-block__primary-meta-container  →  organisation + posted date
- *   div.ecl-content-block__description  →  short description
- *   div.id-Work-Locations  →  "Number of offers: N, Country, City, ..."
- *   div.id-Research-Field  →  "Field » Subfield"
- *   div.id-Researcher-Profile  →  R1/R2/R3/R4
- *   div.id-Funding-Programme  →  EU programme name (or "Not funded by a EU programme")
- *   div.id-Application-Deadline  →  "31 Aug 2026 - 15:00 (Europe/Warsaw)"
+ * Two-pass scraping:
+ *   1. Parse search results for job list (title, org, country, deadline, etc.)
+ *   2. Visit each detail page for full description, requirements, logo
  *
- * The site blocks generic UAs (returns a "Sorry" page); we must send a
- * real browser UA. We use a small cheerio pass instead of regex.
+ * Detail page has structured sections:
+ *   - Offer Description (full text)
+ *   - Requirements (full text)
+ *   - Description list: Organisation, Department, Research Field, etc.
+ *   - Organisation logo in header
  */
 import * as cheerio from 'cheerio';
 import { BaseSource, type SourceContext } from './base.js';
@@ -24,42 +21,21 @@ import type { Opportunity, RawListing } from '../types.js';
 
 const SEARCH_URL =
   'https://euraxess.ec.europa.eu/jobs/search?keywords=phd&status=open&page=0';
+const DETAIL_BASE = 'https://euraxess.ec.europa.eu';
 
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 
-interface EuraxessJob {
-  externalId: string;
-  title: string;
-  url: string;
-  organisation: string;
-  postedAt: string | null;
-  description: string;
-  country: string;
-  city: string;
-  field: string;
-  researcherProfile: string;
-  fundingProgramme: string;
-  deadline: string | null;
-}
-
 function extractValue($article: cheerio.Cheerio<any>, label: string): string {
   const div = $article.find(`div.id-${label}`).first();
   if (!div.length) return '';
-  // Text content, drop the icon SVG and the label, keep only the value.
   const text = div.text().replace(/\s+/g, ' ').trim();
-  // Text is "Label: Value" — strip the label prefix.
   const colon = text.indexOf(':');
   return colon >= 0 ? text.slice(colon + 1).trim() : text;
 }
 
 function parseWorkLocation(value: string): { country: string; city: string } {
-  // "Number of offers: 1, Poland, Kielce University of Technology, Kielce, 25-314, al. ..."
   const parts = value.split(',').map((s) => s.trim()).filter(Boolean);
-  // parts[0] = "Number of offers: N"
-  // parts[1] = country
-  // parts[2] = org name OR city
-  // parts[3] = city (if parts[2] is org) OR address
   let country = '';
   let city = '';
   if (parts.length >= 2) country = parts[1] ?? '';
@@ -69,7 +45,6 @@ function parseWorkLocation(value: string): { country: string; city: string } {
 }
 
 function parseDeadline(value: string): string | null {
-  // "31 Aug 2026 - 15:00 (Europe/Warsaw)" → "2026-08-31"
   const m = value.match(/(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})/);
   if (!m) return null;
   const day = (m[1] ?? '1').padStart(2, '0');
@@ -83,9 +58,9 @@ function parseDeadline(value: string): string | null {
   return `${m[3] ?? new Date().getFullYear()}-${month}-${day}`;
 }
 
-function parseEuraxessHtml(html: string): EuraxessJob[] {
+function parseEuraxessHtml(html: string): { externalId: string; title: string; url: string; organisation: string; postedAt: string | null; description: string; country: string; city: string; field: string; researcherProfile: string; fundingProgramme: string; deadline: string | null; logoUrl: string }[] {
   const $ = cheerio.load(html);
-  const jobs: EuraxessJob[] = [];
+  const jobs: { externalId: string; title: string; url: string; organisation: string; postedAt: string | null; description: string; country: string; city: string; field: string; researcherProfile: string; fundingProgramme: string; deadline: string | null; logoUrl: string }[] = [];
   $('article.ecl-content-item').each((_, el) => {
     const $a = $(el);
     const $title = $a.find('h3.ecl-content-block__title a').first();
@@ -108,25 +83,102 @@ function parseEuraxessHtml(html: string): EuraxessJob[] {
     const fundingProgramme = extractValue($a, 'Funding-Programme');
     const deadline = parseDeadline(extractValue($a, 'Application-Deadline'));
 
-    const url = href.startsWith('http') ? href : `https://euraxess.ec.europa.eu${href}`;
+    const url = href.startsWith('http') ? href : `${DETAIL_BASE}${href}`;
     const externalId = href.match(/\/jobs\/(\d+)/)?.[1] ?? href;
 
     jobs.push({
-      externalId,
-      title,
-      url,
-      organisation,
-      postedAt,
-      description,
-      country,
-      city,
-      field,
-      researcherProfile,
-      fundingProgramme,
-      deadline,
+      externalId, title, url, organisation, postedAt, description,
+      country, city, field, researcherProfile, fundingProgramme, deadline, logoUrl: '',
     });
   });
   return jobs;
+}
+
+/**
+ * Visit a EURAXESS detail page and extract structured data:
+ *   - Full offer description
+ *   - Requirements
+ *   - Organisation logo
+ *   - Website URL
+ */
+async function scrapeDetailPage(url: string): Promise<{
+  fullDescription: string;
+  requirements: string[];
+  logoUrl: string;
+  websiteUrl: string;
+}> {
+  try {
+    const html = await httpGet(url, {
+      headers: {
+        'User-Agent': BROWSER_UA,
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    const $ = cheerio.load(html);
+
+    // Full offer description
+    const descHeading = $('h2').filter((_, el) => /offer description/i.test($(el).text()));
+    let fullDescription = '';
+    if (descHeading.length) {
+      // Get content until next h2
+      let next = descHeading.next();
+      while (next.length && !next.is('h2')) {
+        const text = next.text().replace(/\s+/g, ' ').trim();
+        if (text) fullDescription += text + '\n\n';
+        next = next.next();
+      }
+    }
+    if (!fullDescription) {
+      // Fallback: meta description
+      fullDescription = $('meta[name="description"]').attr('content') ?? '';
+    }
+
+    // Requirements section
+    const reqHeading = $('h2').filter((_, el) => /requirement/i.test($(el).text()));
+    const requirements: string[] = [];
+    if (reqHeading.length) {
+      let next = reqHeading.next();
+      while (next.length && !next.is('h2')) {
+        // Check for list items
+        next.find('li').each((_, li) => {
+          const t = $(li).text().replace(/\s+/g, ' ').trim();
+          if (t) requirements.push(t);
+        });
+        // If no list items, grab paragraph text
+        if (!next.find('li').length) {
+          const text = next.text().replace(/\s+/g, ' ').trim();
+          if (text && text.length > 10) requirements.push(text);
+        }
+        next = next.next();
+      }
+    }
+
+    // Logo — EURAXESS shows org logo in the page header
+    let logoUrl = '';
+    const logoImg = $('img.ecl-content-item__media-container__image, img[class*="logo"], .ecl-site-header__logo img').first();
+    if (logoImg.length) {
+      logoUrl = logoImg.attr('src') ?? '';
+      if (logoUrl && !logoUrl.startsWith('http')) {
+        logoUrl = `${DETAIL_BASE}${logoUrl}`;
+      }
+    }
+
+    // Website URL from description list
+    let websiteUrl = '';
+    $('dt').each((_, dt) => {
+      if (/website/i.test($(dt).text())) {
+        const dd = $(dt).next('dd');
+        const a = dd.find('a').first();
+        websiteUrl = a.attr('href') ?? dd.text().trim();
+      }
+    });
+
+    return { fullDescription: fullDescription.trim(), requirements, logoUrl, websiteUrl };
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, url }, 'euraxess detail scrape failed');
+    return { fullDescription: '', requirements: [], logoUrl: '', websiteUrl: '' };
+  }
 }
 
 export class EuraxessSource extends BaseSource {
@@ -135,14 +187,6 @@ export class EuraxessSource extends BaseSource {
   readonly schedule = '0 */6 * * *';
   readonly origin = 'https://euraxess.ec.europa.eu';
 
-  /**
-   * Override normalize: classify type by researcher profile.
-   *   R1 (First Stage Researcher)  →  phd
-   *   R2 (Recognised Researcher)   →  postdoc
-   *   R3 (Established Researcher)  →  postdoc
-   *   R4 (Leading Researcher)      →  postdoc
-   * Default if unknown: research.
-   */
   override async normalize(raw: RawListing, ctx: SourceContext): Promise<Opportunity> {
     const opp = await normalize(raw, ctx);
     const title = raw.title.toLowerCase();
@@ -167,9 +211,16 @@ export class EuraxessSource extends BaseSource {
       },
     });
     const jobs = parseEuraxessHtml(html);
-    logger.info({ count: jobs.length }, 'euraxess: parsed');
-    return jobs.map((j) => {
-      const text = `${j.title} ${j.field} ${j.description}`.toLowerCase();
+    logger.info({ count: jobs.length }, 'euraxess: parsed list');
+
+    // Visit detail pages for full data (max 20 to avoid rate limits)
+    const detailed: RawListing[] = [];
+    const toScrape = jobs.slice(0, 20);
+
+    for (const j of toScrape) {
+      const detail = await scrapeDetailPage(j.url);
+
+      const text = `${j.title} ${j.field} ${j.description} ${detail.fullDescription}`.toLowerCase();
       const fields: string[] = [];
       if (/math|statistic/.test(text)) fields.push('Mathematics');
       if (/computer|software|ai|machine learning|data|cyber/.test(text)) fields.push('Computer Science');
@@ -178,17 +229,23 @@ export class EuraxessSource extends BaseSource {
       if (/business|management|finance|economic/.test(text)) fields.push('Business');
       if (/medic|health|clinical|pharma/.test(text)) fields.push('Medicine');
       if (/law|legal|political/.test(text)) fields.push('Law');
+      if (/education|teaching|pedagog/.test(text)) fields.push('Education');
       if (fields.length === 0) fields.push('all');
 
       const funding =
         /not funded/i.test(j.fundingProgramme) ? 'unknown' : 'full';
 
-      return {
+      // Build rich description from search + detail
+      const parts = [j.description];
+      if (detail.fullDescription) parts.push(detail.fullDescription);
+      if (detail.websiteUrl) parts.push(`Apply at: ${detail.websiteUrl}`);
+
+      detailed.push({
         externalId: j.externalId,
-        url: j.url,
+        url: detail.websiteUrl || j.url,
         title: j.title,
         provider: j.organisation,
-        description: j.description.slice(0, 1500),
+        description: parts.join('\n\n').slice(0, 3000),
         rawFields: fields,
         rawCountries: [j.country || 'EU'],
         rawDegreeLevels: j.researcherProfile.match(/R1/i)
@@ -196,7 +253,20 @@ export class EuraxessSource extends BaseSource {
           : ['phd', 'postdoc'],
         rawFundingKind: funding as 'full' | 'unknown',
         rawDeadline: j.deadline ?? undefined,
-      };
-    });
+        rawRequirements: detail.requirements,
+        rawTags: [j.field, j.fundingProgramme].filter(
+          (t) => t && !/not funded/i.test(t),
+        ),
+        rawLogoUrl: detail.logoUrl || undefined,
+      });
+
+      // Small delay between detail page fetches
+      if (toScrape.indexOf(j) < toScrape.length - 1) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+
+    logger.info({ count: detailed.length }, 'euraxess: detailed scrape done');
+    return detailed;
   }
 }
