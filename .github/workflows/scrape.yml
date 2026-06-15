@@ -24,7 +24,8 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - name: Install deps
-        run: npm ci --no-audit --no-fund
+        # --include=dev: NODE_ENV=production would otherwise skip devDependencies (tsx)
+        run: npm ci --no-audit --no-fund --include=dev
       - name: Run all enabled sources
         env:
           TURSO_URL: ${{ secrets.TURSO_URL }}
